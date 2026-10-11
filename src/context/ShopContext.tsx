@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import { supabase } from '../lib/supabase';
 import { deleteProductImage } from '../lib/storage';
 import { useAuth } from './AuthContext';
-import type { Product } from '../data/products';
+import type { Category, Product, ProductStatus } from '../data/products';
 
 export type ProductId = number | string;
 
@@ -12,16 +12,29 @@ export interface CartItem {
   quantity: number;
 }
 
-// Данные формы продажи (id и владельца задаём сами)
-export type NewProduct = Omit<Product, 'id' | 'user_id'>;
+// Данные формы продажи (id, артикул и продавца задаём сами)
+export interface NewProduct {
+  name: string;
+  category_id: number;
+  brand: string | null;
+  price: number;
+  old_price: number | null;
+  stock: number;
+  description: string;
+  specs: Record<string, string>;
+  status?: ProductStatus;
+  imageUrls: string[]; // до 5 штук, порядок = порядок показа
+}
 
 interface ShopContextValue {
   favoriteIds: ProductId[];
   cartItems: CartItem[];
-  allProducts: Product[];
-  userProducts: Product[];
+  allProducts: Product[]; // каталог: только активные товары
+  userProducts: Product[]; // все товары текущего продавца
+  categories: Category[];
   loading: boolean;
   loadError: string;
+  refresh: () => void; // перечитать товары, остатки, корзину и избранное
 
   isFavorite: (id: ProductId) => boolean;
   toggleFavorite: (id: ProductId) => void;
@@ -41,8 +54,23 @@ interface ShopContextValue {
 
 const FAVORITES_KEY = 'minimal-market:favorites';
 const CART_KEY = 'minimal-market:cart';
-const PRODUCT_FIELDS =
-  'id, name, category, price, emoji, description, user_id, image_url';
+
+// Товар вместе с фото, категорией и продавцом одним запросом
+const PRODUCT_SELECT = `
+  id, seller_id, category_id, name, brand, sku, price, old_price, stock,
+  description, specs, status, created_at, rating_avg, reviews_count,
+  images:product_images(id, url, position),
+  category:categories(id, name, slug, parent_id),
+  seller:profiles(id, name, shop_name, avatar_url)
+`;
+
+function normalizeProduct(row: unknown): Product {
+  const product = row as Product;
+  return {
+    ...product,
+    images: [...(product.images ?? [])].sort((a, b) => a.position - b.position),
+  };
+}
 
 function loadFromStorage<T>(key: string, fallback: T): T {
   try {
@@ -53,107 +81,322 @@ function loadFromStorage<T>(key: string, fallback: T): T {
   }
 }
 
+function saveToStorage(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // хранилище недоступно, не страшно
+  }
+}
+
 const ShopContext = createContext<ShopContextValue | null>(null);
 
 export function ShopProvider({ children }: { children: ReactNode }) {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
 
-  const [allProducts, setAllProducts] = useState<Product[]>([]);
+  // Все товары, которые разрешено видеть этому пользователю
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
 
-  const [favoriteIds, setFavoriteIds] = useState<ProductId[]>(() =>
-    loadFromStorage<ProductId[]>(FAVORITES_KEY, [])
-  );
-  const [cartItems, setCartItems] = useState<CartItem[]>(() =>
-    loadFromStorage<CartItem[]>(CART_KEY, [])
-  );
+  const [favoriteIds, setFavoriteIds] = useState<ProductId[]>([]);
+  const [cartItems, setCartItems] = useState<CartItem[]>([]);
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  // Загружаем товары из Supabase при старте
+  // Загружаем товары и категории при старте, смене пользователя и refresh()
   useEffect(() => {
     let cancelled = false;
 
-    async function loadProducts() {
-      const { data, error } = await supabase
-        .from('products')
-        .select(PRODUCT_FIELDS)
-        .order('id', { ascending: false });
+    async function loadData() {
+      const [productsRes, categoriesRes] = await Promise.all([
+        supabase
+          .from('products')
+          .select(PRODUCT_SELECT)
+          .order('id', { ascending: false }),
+        supabase
+          .from('categories')
+          .select('id, name, slug, parent_id')
+          .order('name'),
+      ]);
 
       if (cancelled) return;
 
-      if (error) {
+      if (productsRes.error || categoriesRes.error) {
         setLoadError('Не удалось загрузить товары. Попробуйте позже.');
-        console.error('Supabase:', error);
+        console.error('Supabase:', productsRes.error ?? categoriesRes.error);
       } else {
-        setAllProducts((data ?? []) as Product[]);
+        setLoadError('');
+        setProducts((productsRes.data ?? []).map(normalizeProduct));
+        setCategories((categoriesRes.data ?? []) as Category[]);
       }
       setLoading(false);
     }
 
-    loadProducts();
+    loadData();
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [user?.id, refreshKey]);
 
+  // Избранное и корзина: гость берёт из localStorage, вошедший из базы
   useEffect(() => {
-    localStorage.setItem(FAVORITES_KEY, JSON.stringify(favoriteIds));
-  }, [favoriteIds]);
+    if (authLoading) return;
 
-  useEffect(() => {
-    localStorage.setItem(CART_KEY, JSON.stringify(cartItems));
-  }, [cartItems]);
+    // Гость
+    if (!user) {
+      setFavoriteIds(loadFromStorage<ProductId[]>(FAVORITES_KEY, []));
+      setCartItems(loadFromStorage<CartItem[]>(CART_KEY, []));
+      return;
+    }
 
-  // Товары текущего пользователя
+    // Вошедший пользователь
+    let cancelled = false;
+    const userId = user.id;
+
+    async function syncUserLists() {
+      const [favRes, cartRes] = await Promise.all([
+        supabase.from('favorites').select('product_id'),
+        supabase.from('cart_items').select('product_id, quantity'),
+      ]);
+
+      if (cancelled) return;
+
+      if (favRes.error || cartRes.error) {
+        console.error('Supabase:', favRes.error ?? cartRes.error);
+        return;
+      }
+
+      const dbFavorites = (favRes.data ?? []).map((row) =>
+        Number(row.product_id)
+      );
+      const dbCart = new Map<number, number>(
+        (cartRes.data ?? []).map((row) => [Number(row.product_id), row.quantity])
+      );
+
+      // Что гость успел накопить до входа
+      const localFavorites = loadFromStorage<ProductId[]>(FAVORITES_KEY, [])
+        .map(Number)
+        .filter((n) => Number.isInteger(n));
+      const localCart = loadFromStorage<CartItem[]>(CART_KEY, [])
+        .map((item) => ({
+          productId: Number(item.productId),
+          quantity: item.quantity,
+        }))
+        .filter(
+          (item) => Number.isInteger(item.productId) && item.quantity > 0
+        );
+
+      // Оставляем только товары, которые реально есть в базе
+      const localIds = [
+        ...new Set([...localFavorites, ...localCart.map((i) => i.productId)]),
+      ];
+      let existing = new Set<number>();
+      if (localIds.length > 0) {
+        const { data } = await supabase
+          .from('products')
+          .select('id')
+          .in('id', localIds);
+        existing = new Set((data ?? []).map((row) => Number(row.id)));
+      }
+
+      const newFavorites = localFavorites.filter(
+        (id) => existing.has(id) && !dbFavorites.includes(id)
+      );
+
+      const mergedCart = new Map(dbCart);
+      const cartToSave: {
+        user_id: string;
+        product_id: number;
+        quantity: number;
+      }[] = [];
+      for (const item of localCart) {
+        if (!existing.has(item.productId)) continue;
+        const current = mergedCart.get(item.productId) ?? 0;
+        if (item.quantity > current) {
+          mergedCart.set(item.productId, item.quantity);
+          cartToSave.push({
+            user_id: userId,
+            product_id: item.productId,
+            quantity: item.quantity,
+          });
+        }
+      }
+
+      if (newFavorites.length > 0) {
+        const { error } = await supabase.from('favorites').upsert(
+          newFavorites.map((id) => ({ user_id: userId, product_id: id })),
+          { onConflict: 'user_id,product_id', ignoreDuplicates: true }
+        );
+        if (error) console.error('Supabase:', error);
+      }
+
+      if (cartToSave.length > 0) {
+        const { error } = await supabase
+          .from('cart_items')
+          .upsert(cartToSave, { onConflict: 'user_id,product_id' });
+        if (error) console.error('Supabase:', error);
+      }
+
+      if (cancelled) return;
+
+      // Гостевые данные перенесены, чистим
+      localStorage.removeItem(FAVORITES_KEY);
+      localStorage.removeItem(CART_KEY);
+
+      setFavoriteIds([...new Set([...dbFavorites, ...newFavorites])]);
+      setCartItems(
+        [...mergedCart.entries()].map(([productId, quantity]) => ({
+          productId,
+          quantity,
+        }))
+      );
+    }
+
+    syncUserLists();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, authLoading, refreshKey]);
+
+  const refresh = () => setRefreshKey((k) => k + 1);
+
+  // Каталог видит только активные товары
+  const allProducts = products.filter((p) => p.status === 'active');
+
+  // Товары текущего продавца (включая черновики и скрытые)
   const userProducts = user
-    ? allProducts.filter((p) => p.user_id === user.id)
+    ? products.filter((p) => p.seller_id === user.id)
     : [];
 
   // ----- Избранное -----
   const isFavorite = (id: ProductId) => favoriteIds.includes(id);
 
   const toggleFavorite = (id: ProductId) => {
-    setFavoriteIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+    const previous = favoriteIds;
+    const wasFavorite = previous.includes(id);
+    const next = wasFavorite
+      ? previous.filter((x) => x !== id)
+      : [...previous, id];
+
+    setFavoriteIds(next);
+
+    if (!user) {
+      saveToStorage(FAVORITES_KEY, next);
+      return;
+    }
+
+    const request = wasFavorite
+      ? supabase.from('favorites').delete().eq('product_id', id)
+      : supabase.from('favorites').upsert(
+          { user_id: user.id, product_id: id },
+          { onConflict: 'user_id,product_id', ignoreDuplicates: true }
+        );
+
+    request.then(({ error }) => {
+      if (error) {
+        console.error('Supabase:', error);
+        setFavoriteIds(previous); // откат
+      }
+    });
   };
 
   // ----- Корзина -----
   const isInCart = (id: ProductId) =>
     cartItems.some((item) => item.productId === id);
 
-  const addToCart = (id: ProductId) => {
-    setCartItems((prev) => {
-      const existing = prev.find((item) => item.productId === id);
-      if (existing) {
-        return prev.map((item) =>
-          item.productId === id
-            ? { ...item, quantity: item.quantity + 1 }
-            : item
-        );
+  // Сохраняет новое состояние корзины для одного товара
+  const applyCart = (next: CartItem[], changedId: ProductId) => {
+    const previous = cartItems;
+    setCartItems(next);
+
+    if (!user) {
+      saveToStorage(CART_KEY, next);
+      return;
+    }
+
+    const item = next.find((x) => x.productId === changedId);
+    const request = item
+      ? supabase.from('cart_items').upsert(
+          { user_id: user.id, product_id: changedId, quantity: item.quantity },
+          { onConflict: 'user_id,product_id' }
+        )
+      : supabase.from('cart_items').delete().eq('product_id', changedId);
+
+    request.then(({ error }) => {
+      if (error) {
+        console.error('Supabase:', error);
+        setCartItems(previous); // откат
       }
-      return [...prev, { productId: id, quantity: 1 }];
     });
   };
 
-  const removeFromCart = (id: ProductId) => {
-    setCartItems((prev) => prev.filter((item) => item.productId !== id));
+  const stockOf = (id: ProductId) =>
+    products.find((p) => p.id === id)?.stock ?? 0;
+
+  const addToCart = (id: ProductId) => {
+    const existing = cartItems.find((item) => item.productId === id);
+    const nextQuantity = (existing?.quantity ?? 0) + 1;
+
+    if (nextQuantity > stockOf(id)) return;
+
+    const next = existing
+      ? cartItems.map((item) =>
+          item.productId === id ? { ...item, quantity: nextQuantity } : item
+        )
+      : [...cartItems, { productId: id, quantity: 1 }];
+
+    applyCart(next, id);
   };
 
-  const changeQuantity = (id: ProductId, delta: number) => {
-    setCartItems((prev) =>
-      prev
-        .map((item) =>
-          item.productId === id
-            ? { ...item, quantity: item.quantity + delta }
-            : item
-        )
-        .filter((item) => item.quantity > 0)
+  const removeFromCart = (id: ProductId) => {
+    applyCart(
+      cartItems.filter((item) => item.productId !== id),
+      id
     );
   };
 
-  const clearCart = () => setCartItems([]);
+  const changeQuantity = (id: ProductId, delta: number) => {
+    const existing = cartItems.find((item) => item.productId === id);
+    if (!existing) return;
+
+    const nextQuantity = existing.quantity + delta;
+
+    // Больше остатка добавить нельзя
+    if (delta > 0 && nextQuantity > stockOf(id)) return;
+
+    const next =
+      nextQuantity > 0
+        ? cartItems.map((item) =>
+            item.productId === id ? { ...item, quantity: nextQuantity } : item
+          )
+        : cartItems.filter((item) => item.productId !== id);
+
+    applyCart(next, id);
+  };
+
+  const clearCart = () => {
+    const previous = cartItems;
+    setCartItems([]);
+
+    if (!user) {
+      saveToStorage(CART_KEY, []);
+      return;
+    }
+
+    supabase
+      .from('cart_items')
+      .delete()
+      .eq('user_id', user.id)
+      .then(({ error }) => {
+        if (error) {
+          console.error('Supabase:', error);
+          setCartItems(previous); // откат
+        }
+      });
+  };
 
   // ----- Товары в базе -----
   const addProduct = async (data: NewProduct): Promise<Product> => {
@@ -161,24 +404,63 @@ export function ShopProvider({ children }: { children: ReactNode }) {
       throw new Error('Войдите в аккаунт, чтобы продавать товары.');
     }
 
+    const { imageUrls, ...fields } = data;
+
+    // 1. Сам товар
     const { data: created, error } = await supabase
       .from('products')
-      .insert({ ...data, user_id: user.id })
-      .select(PRODUCT_FIELDS)
+      .insert({ ...fields, seller_id: user.id })
+      .select('id')
       .single();
 
     if (error || !created) {
       console.error('Supabase:', error);
-      throw new Error('Не удалось опубликовать товар.');
+      throw new Error(
+        'Не удалось опубликовать товар. Проверьте, что у вас есть права продавца.'
+      );
     }
 
-    const product = created as Product;
-    setAllProducts((prev) => [product, ...prev]);
+    // 2. Фотографии
+    if (imageUrls.length > 0) {
+      const { error: imagesError } = await supabase
+        .from('product_images')
+        .insert(
+          imageUrls.map((url, index) => ({
+            product_id: created.id,
+            url,
+            position: index,
+          }))
+        );
+
+      if (imagesError) {
+        console.error('Supabase:', imagesError);
+        // Откатываем: не оставляем товар без фото
+        await supabase.from('products').delete().eq('id', created.id);
+        throw new Error('Не удалось сохранить фотографии товара.');
+      }
+    }
+
+    // 3. Читаем товар целиком (с фото, категорией, продавцом)
+    const { data: full, error: fullError } = await supabase
+      .from('products')
+      .select(PRODUCT_SELECT)
+      .eq('id', created.id)
+      .single();
+
+    if (fullError || !full) {
+      console.error('Supabase:', fullError);
+      throw new Error(
+        'Товар создан, но не удалось его загрузить. Обновите страницу.'
+      );
+    }
+
+    const product = normalizeProduct(full);
+    setProducts((prev) => [product, ...prev]);
     return product;
   };
 
   const removeProduct = async (id: number): Promise<void> => {
-    const target = allProducts.find((p) => p.id === id);
+    const target = products.find((p) => p.id === id);
 
     const { data, error } = await supabase
       .from('products')
@@ -196,10 +478,13 @@ export function ShopProvider({ children }: { children: ReactNode }) {
       throw new Error('Этот товар можно удалить только его владельцу.');
     }
 
-    // Строка удалена, теперь удаляем и файл с фото
-    await deleteProductImage(target?.image_url);
+    // Строки удалены (фото, избранное и корзины ушли каскадом),
+    // теперь удаляем сами файлы
+    await Promise.allSettled(
+      (target?.images ?? []).map((image) => deleteProductImage(image.url))
+    );
 
-    setAllProducts((prev) => prev.filter((p) => p.id !== id));
+    setProducts((prev) => prev.filter((p) => p.id !== id));
     setFavoriteIds((prev) => prev.filter((x) => x !== id));
     setCartItems((prev) => prev.filter((item) => item.productId !== id));
   };
@@ -215,8 +500,10 @@ export function ShopProvider({ children }: { children: ReactNode }) {
         cartItems,
         allProducts,
         userProducts,
+        categories,
         loading,
         loadError,
+        refresh,
         isFavorite,
         toggleFavorite,
         isInCart,

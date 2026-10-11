@@ -3,8 +3,20 @@ import type { ReactNode } from 'react';
 import type { User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
+export interface Profile {
+  id: string;
+  name: string;
+  avatar_url: string | null;
+  shop_name: string | null;
+  is_seller: boolean;
+  is_admin: boolean;
+}
+
 interface AuthContextValue {
   user: User | null;
+  profile: Profile | null;
+  isSeller: boolean;
+  isAdmin: boolean;
   loading: boolean;
   signUp: (
     email: string,
@@ -12,6 +24,7 @@ interface AuthContextValue {
   ) => Promise<{ needsConfirmation: boolean }>;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
+  refreshProfile: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -41,15 +54,33 @@ function translateError(message: string): string {
   return 'Не удалось выполнить действие. Попробуйте ещё раз.';
 }
 
+async function fetchProfile(userId: string): Promise<Profile | null> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, name, avatar_url, shop_name, is_seller, is_admin')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('Supabase:', error);
+    return null;
+  }
+  return (data as Profile | null) ?? null;
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [sessionLoading, setSessionLoading] = useState(true);
+
+  const [profile, setProfile] = useState<Profile | null>(null);
+  // Для какого пользователя мы уже попытались загрузить профиль
+  const [profileTriedFor, setProfileTriedFor] = useState<string | null>(null);
 
   useEffect(() => {
     // Текущая сессия при загрузке страницы
     supabase.auth.getSession().then(({ data }) => {
       setUser(data.session?.user ?? null);
-      setLoading(false);
+      setSessionLoading(false);
     });
 
     // Реагируем на вход и выход
@@ -59,6 +90,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     return () => data.subscription.unsubscribe();
   }, []);
+
+  // Профиль грузим отдельно, когда меняется пользователь
+  useEffect(() => {
+    if (!user) {
+      setProfile(null);
+      setProfileTriedFor(null);
+      return;
+    }
+
+    let cancelled = false;
+    const userId = user.id;
+
+    fetchProfile(userId).then((result) => {
+      if (cancelled) return;
+      setProfile(result);
+      setProfileTriedFor(userId);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
+  const profileReady = !user || profileTriedFor === user.id;
+  const loading = sessionLoading || !profileReady;
+
+  const refreshProfile = async () => {
+    if (!user) return;
+    setProfile(await fetchProfile(user.id));
+  };
 
   const signUp = async (email: string, password: string) => {
     const { data, error } = await supabase.auth.signUp({ email, password });
@@ -81,7 +142,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, signUp, signIn, signOut }}>
+    <AuthContext.Provider
+      value={{
+        user,
+        profile,
+        isSeller: profile?.is_seller ?? false,
+        isAdmin: profile?.is_admin ?? false,
+        loading,
+        signUp,
+        signIn,
+        signOut,
+        refreshProfile,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );

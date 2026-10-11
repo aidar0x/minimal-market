@@ -69,11 +69,16 @@ function CartPage() {
                 </Link>
 
                 <div className="cart-item-info">
-                  <p className="product-category">{product.category}</p>
+                  <p className="product-category">{product.category?.name}</p>
                   <h3>{product.name}</h3>
                   <p className="product-price">
                     {product.price.toLocaleString('ru-RU')} ₽
                   </p>
+                  {quantity > product.stock && (
+                    <p className="form-error">
+                      В наличии только {product.stock} шт.
+                    </p>
+                  )}
                 </div>
 
                 <div className="quantity-control">
@@ -88,6 +93,7 @@ function CartPage() {
 
                   <button
                     onClick={() => changeQuantity(product.id, 1)}
+                    disabled={quantity >= product.stock}
                     aria-label="Увеличить количество"
                   >
                     <Plus size={15} />
@@ -110,7 +116,9 @@ function CartPage() {
             <p className="cart-total">
               {total.toLocaleString('ru-RU')} ₽
             </p>
-            <button className="primary-button">Оформить заказ</button>
+            <Link className="primary-button" to="/checkout">
+                 Оформить заказ
+            </Link>
           </aside>
         </div>
       )}

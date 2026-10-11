@@ -10,24 +10,16 @@ import {
   uploadProductImage,
 } from '../lib/storage';
 
-const CATEGORIES = [
-  'Электроника',
-  'Аксессуары',
-  'Для дома',
-  'Одежда',
-  'Книги',
-  'Другое',
-];
-
 function SellPage() {
-  const { addProduct } = useShop();
+  const { addProduct, categories } = useShop();
   const { user } = useAuth();
   const navigate = useNavigate();
 
   const [name, setName] = useState('');
-  const [category, setCategory] = useState(CATEGORIES[0]);
+  const [categoryId, setCategoryId] = useState('');
+  const [brand, setBrand] = useState('');
   const [price, setPrice] = useState('');
-  const [emoji, setEmoji] = useState('📦');
+  const [stock, setStock] = useState('1');
   const [description, setDescription] = useState('');
   const [photo, setPhoto] = useState<File | null>(null);
   const [preview, setPreview] = useState('');
@@ -71,14 +63,25 @@ function SellPage() {
     event.preventDefault();
 
     const priceNumber = Number(price);
+    const stockNumber = Math.floor(Number(stock));
 
     if (!name.trim()) {
       setError('Укажите название товара.');
       return;
     }
 
+    if (!categoryId) {
+      setError('Выберите категорию.');
+      return;
+    }
+
     if (!price || Number.isNaN(priceNumber) || priceNumber <= 0) {
       setError('Укажите цену больше нуля.');
+      return;
+    }
+
+    if (Number.isNaN(stockNumber) || stockNumber < 0) {
+      setError('Остаток не может быть отрицательным.');
       return;
     }
 
@@ -99,11 +102,14 @@ function SellPage() {
 
       const product = await addProduct({
         name: name.trim(),
-        category,
+        category_id: Number(categoryId),
+        brand: brand.trim() || null,
         price: Math.round(priceNumber),
-        emoji: emoji.trim() || '📦',
+        old_price: null,
+        stock: stockNumber,
         description: description.trim() || 'Описание не указано.',
-        image_url: imageUrl,
+        specs: {},
+        imageUrls: imageUrl ? [imageUrl] : [],
       });
 
       navigate(`/product/${product.id}`);
@@ -136,17 +142,30 @@ function SellPage() {
           <label className="form-field">
             <span>Категория</span>
             <select
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
+              value={categoryId}
+              onChange={(e) => setCategoryId(e.target.value)}
             >
-              {CATEGORIES.map((item) => (
-                <option key={item} value={item}>
-                  {item}
+              <option value="">Выберите категорию</option>
+              {categories.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
                 </option>
               ))}
             </select>
           </label>
 
+          <label className="form-field">
+            <span>Бренд</span>
+            <input
+              type="text"
+              value={brand}
+              onChange={(e) => setBrand(e.target.value)}
+              placeholder="Необязательно"
+            />
+          </label>
+        </div>
+
+        <div className="form-row">
           <label className="form-field">
             <span>Цена, ₽</span>
             <input
@@ -155,6 +174,16 @@ function SellPage() {
               value={price}
               onChange={(e) => setPrice(e.target.value)}
               placeholder="1500"
+            />
+          </label>
+
+          <label className="form-field">
+            <span>Остаток, шт.</span>
+            <input
+              type="number"
+              min="0"
+              value={stock}
+              onChange={(e) => setStock(e.target.value)}
             />
           </label>
         </div>
@@ -181,25 +210,13 @@ function SellPage() {
           )}
         </div>
 
-        {!photo && (
-          <label className="form-field form-field-small">
-            <span>Эмодзи (если нет фото)</span>
-            <input
-              type="text"
-              maxLength={4}
-              value={emoji}
-              onChange={(e) => setEmoji(e.target.value)}
-            />
-          </label>
-        )}
-
         <label className="form-field">
           <span>Описание</span>
           <textarea
             rows={4}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="Расскажите о состоянии и особенностях товара"
+            placeholder="Расскажите о товаре и его особенностях"
           />
         </label>
 

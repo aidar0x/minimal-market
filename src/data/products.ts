@@ -1,46 +1,42 @@
+export interface ProductImage {
+  id: number;
+  url: string;
+  position: number;
+}
 
-export type Product = {
+export interface Category {
   id: number;
   name: string;
-  category: string;
-  price: number;
-  emoji: string;
-  description: string;
-  user_id?: string | null;
-  image_url?: string | null;
-};
+  slug: string;
+  parent_id: number | null;
+}
 
-export const products: Product[] = [
-  {
-    id: 1,
-    name: 'Наушники',
-    category: 'Электроника',
-    price: 4990,
-    emoji: '🎧',
-    description: 'Удобные наушники для музыки и повседневного использования.',
-  },
-  {
-    id: 2,
-    name: 'Городской рюкзак',
-    category: 'Аксессуары',
-    price: 3290,
-    emoji: '🎒',
-    description: 'Практичный рюкзак для города, учёбы и путешествий.',
-  },
-  {
-    id: 3,
-    name: 'Настольная лампа',
-    category: 'Для дома',
-    price: 2190,
-    emoji: '💡',
-    description: 'Минималистичная лампа для рабочего стола.',
-  },
-  {
-    id: 4,
-    name: 'Плёночный фотоаппарат',
-    category: 'Электроника',
-    price: 6790,
-    emoji: '📷',
-    description: 'Фотоаппарат для любителей аналоговой фотографии.',
-  },
-];
+export interface Seller {
+  id: string;
+  name: string;
+  shop_name: string | null;
+  avatar_url: string | null;
+}
+
+export type ProductStatus = 'draft' | 'active' | 'hidden';
+
+export interface Product {
+  id: number;
+  seller_id: string;
+  category_id: number | null;
+  name: string;
+  brand: string | null;
+  sku: string;
+  price: number;
+  old_price: number | null;
+  stock: number;
+  description: string;
+  specs: Record<string, string>;
+  status: ProductStatus;
+  rating_avg: number;
+  reviews_count: number;
+  created_at: string;
+  images: ProductImage[];
+  category: Category | null;
+  seller: Seller | null;
+}
