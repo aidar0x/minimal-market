@@ -50,6 +50,8 @@
 - 
 ## Технологии
 
+| Область | Инструменты |
+|---|---|
 | Фронтенд | React 19, TypeScript, Vite |
 | Маршрутизация | React Router DOM 7 |
 | Иконки | Lucide React |
